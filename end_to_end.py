@@ -24,8 +24,12 @@ from torchvision import models, transforms
 import sys
 from typing import Union
 import argparse
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+import random
 
 ### TODO -- have chatgpt make docstrings, comments, etc.
+DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 def main(video_source_folder_: str, output_image_folder_: str, crop_reg: list, nth_frame_: int):
     
@@ -52,6 +56,16 @@ def main(video_source_folder_: str, output_image_folder_: str, crop_reg: list, n
     
     # do kmeans to separate into two clusters
     km_labels, km_object = kmeans_(reduced_dimensions_all_images, 2)
+    
+    # use binary classifier resnet to "decide" which cluster has a cow in it
+    batch_size = 1
+    for lab in np.unique(km_labels):
+        sampled_img_paths = get_images_from_indices(km_labels, lab, img_array, output_image_folder_)
+        get_labels_from_these_images = InferenceDataset(sampled_img_paths, transform=resnet18_transform)
+        labels_dataloader = DataLoader(get_labels_from_these_images, batch_size=batch_size, shuffle=False)
+        print('dawg')
+    
+    ### TODO -- function for other transform (resnet18 input size instead of resnet50 size)
     
     ### TODO -- # get image_ids associated with each label in the kmeans
     
@@ -261,8 +275,8 @@ def load_feature_extractor():
     return feature_extractor
 
 
-def create_transform():
-    """Create a transformation pipeline."""
+def resnet50_transform():
+    """Create a transformation pipeline with the appropriate input image size for a resnet50."""
     
     transform = transforms.Compose([
         transforms.Resize(256),
@@ -272,21 +286,36 @@ def create_transform():
     return transform
 
 
+def resnet18_transform():
+    """Create a transformation pipeline with the appropriate input image size for a resnet18."""
+    ### TODO -- combine the two transformation functions into one that just takes the input dumension as an argument
+    mean = np.array([0.485, 0.456, 0.406])  # double-check to make sure these are the right values
+    std = np.array([0.229, 0.224, 0.225])
+    
+    transform = transforms.Compose([
+        transforms.Resize((224,224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)
+    ])
+    return transform
+
+
 def extract_features(image_array):
     """Using the resnet, extract features from a given image."""
 
     # load resnet50 in eval mode w last layer "sliced" off, create transform pipeline
     feature_extractor = load_feature_extractor()
-    transform = create_transform()
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    fe = feature_extractor.to(device)
-    image_tensor = torch.from_numpy(image_array)#.to(device)
+    transform = resnet50_transform()
+    # device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    print(f'Beginning feature extraction using {DEVICE}...')
+    fe = feature_extractor.to(DEVICE)
+    image_tensor = torch.from_numpy(image_array)#.to(DEVICE)
     
     all_features = []
     for img in image_tensor:
         img = transform(Image.fromarray(img.numpy()))
         img = img.unsqueeze(0)
-        features = feature_extractor(img.to(device))
+        features = feature_extractor(img.to(DEVICE))
         all_features.append(features.detach().cpu().numpy())
         
     all_features = np.array(all_features)[:,0,:,0,0]    #make sure it's the right dimension
@@ -350,10 +379,70 @@ def create_plots(km_, features):  # don't worry too much about this for now, and
     return 
 
 
+class InferenceDataset(Dataset):  # this needs a better name, ngl
+    def __init__(self, file_paths, transform=None):
+        self.file_paths = file_paths
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.file_paths)
+
+    def __getitem__(self, index):
+        image = Image.open(self.file_paths[index]).convert('RGB')
+
+        if self.transform is not None:
+            image = self.transform(image)
+
+        return image
+    
+
+def load_binary_classifier():
+    bc = models.resnet18(pretrained=False)  # load model
+    class_names = ['has_a_cow', 'has_no_cow']
+    # adjust number of features to match the input
+    num_features = bc.fc.in_features
+    bc.fc = torch.nn.Linear(num_features, len(class_names))
+    # load the fine-tuned version
+    bc.load_state_dict(torch.load('binary_classifier_cnn.pth'))
+    bc.to(DEVICE)  # send to GPU, if available
+    return bc
+
+
+def check_match(element_, label_number_):
+    # return np.array(array_to_check) == label_number
+    return element_ == label_number_
+
+
+def indices_matching_condition(lst, label_number):
+    return [index for index, element in enumerate(lst) if check_match(element, label_number)]
+
+
+def get_images_from_indices(array_to_match_from, what_to_match, image_list_to_filter, path_to_images):
+    """
+    Params:
+    array_to_match_from: the kmeans_labels array (or equivalent)
+    what_to_match: one of the unique values in kmeans_labels (probably will be 0 or 1)
+    image_list_to_filter: a list of image names
+    path_to_images: the relative path to the images in image_list_to_filter
+    """
+
+    n_to_sample = int(.12 * sum(np.array(array_to_match_from) == what_to_match))
+    # get all indices for a certain label
+    indices = indices_matching_condition(array_to_match_from, what_to_match)
+
+    # randomly sample from those indices
+    indices_subset = random.sample(indices, n_to_sample)
+
+    # get a list of the paths to the images in the subset
+    image_path_subset = [os.path.join(path_to_images, path) for path in list(np.array(image_list_to_filter)[indices_subset])]
+    
+    return image_path_subset
+
+
 if __name__ == '__main__':
     cli = argparse.ArgumentParser()
     cli.add_argument(
-        '--video_folder',
+        '--video_folder',  # TODO -- figure out how to include shortened flags maybe
         nargs=1,
         type=str
     )
@@ -373,6 +462,9 @@ if __name__ == '__main__':
         type=int
     )
     args = cli.parse_args()
+    
+    # python3 end_to_end.py --video_folder sandbox/videos_to_process/ --image_folder sandbox/write_to_here/ --region 180 1 450 400 --nth 120
+    
     # print(args.source_folder[0], args.output_folder[0], args.region, args.nth[0])
     # video_source_folder = args[0]
     # output_image_folder = args[1]
