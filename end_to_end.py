@@ -39,40 +39,57 @@ def main(video_source_folder_: str, output_image_folder_: str, crop_reg: list, n
     crop_regions = crop_reg  # [(180, 1, 450, 400)]  # use to crop out the feed bins; good for bin no. 3
     nth_frame = nth_frame_
 
-    video_files_only = string_into_sorted_dir_list(video_source_folder, extension='.mp4')    
+    video_files_only = string_into_sorted_dir_list(video_source_folder, extension='.mp4')
     date = '2023-08-22' ### TODO -- create a function that parses the date out from the filenames, add date as an option on the command line maybe
 
     # for filet in video_files_only:
     #     video_processor(video_source_folder, image_folder, filet, crop_regions, date, nth_frame)
-        
+    
+    # get a list of all the images sorted by image name (no path to them though)
+    sorted_image_names = get_sorted_image_list(image_folder)
+    sorted_image_paths = [os.path.join(image_folder, im_path) for im_path in sorted_image_names]  # add the path to the images
+    
     # turn images from the recently processed video into a numpy array
-    img_array = images_into_array(image_folder)
+    img_array = images_into_array(sorted_image_names, image_folder)  # gets sorted by image name inside the function
     
     # extract features from array of images
     resnet_features = extract_features(img_array)
     
     # reduce their dimensionality
-    reduced_dimensions_all_images = pca_(resnet_features, 2)
+    pca_reduced_dimensions_all_images = pca_(resnet_features, 2)
     
     # do kmeans to separate into two clusters
-    km_labels, km_object = kmeans_(reduced_dimensions_all_images, 2)
+    km_labels, km_object = kmeans_(pca_reduced_dimensions_all_images, 2)
     
     # use binary classifier resnet to "decide" which cluster has a cow in it
     batch_size = 1
+    class_names = ['has_a_cow', 'has_no_cow']
+    binary_classifier = load_binary_classifier(class_names)
     for lab in np.unique(km_labels):
-        sampled_img_paths = get_images_from_indices(km_labels, lab, img_array, output_image_folder_)
+        # get all images that correspond to a certain cluster
+        sampled_img_paths = get_images_from_indices(km_labels, lab, sorted_image_names, output_image_folder_)  
+        # transform the images
         get_labels_from_these_images = InferenceDataset(sampled_img_paths, transform=resnet18_transform)
+        # create dataloader from those images
         labels_dataloader = DataLoader(get_labels_from_these_images, batch_size=batch_size, shuffle=False)
-        print('dawg')
+        # get predictions from those images
+        cow_presence_preds = identify_animal_cluster(binary_classifier, labels_dataloader, class_names)
+        if sum(np.array(cow_presence_preds) == 'has_a_cow') >= (.8 * len(cow_presence_preds)):
+            print(f'Many cow images detected in cluster {lab}. {lab} will be treated as the cluster with cows for the animal id section.')
+            cluster_with_cows = lab
+            break
+        else:
+            print(f'Few cow images detected in cluster {lab}.')
+    feature_subset = np.array(resnet_features)[km_labels == cluster_with_cows][:,:,0,0]
+    
+    animal_ids = assign_animal_ids(feature_subset)
+    return animal_ids
     
     ### TODO -- function for other transform (resnet18 input size instead of resnet50 size)
     
     ### TODO -- # get image_ids associated with each label in the kmeans
     
-    ### TODO -- how do you detect which one has a cow in it?
-    
-    
-    return video_source_folder, image_folder, crop_regions, nth_frame
+    # return video_source_folder, image_folder, crop_regions, nth_frame
 
 
 def video_processor(video_source_folder: str, output_image_folder_: str, filename: str, crop_region_: tuple, date_: str, nth_frame: int):
@@ -245,12 +262,18 @@ def time_adder(datetime_object: datetime.datetime, every_n_frames: float, fps=30
     else:
         raise ValueError('This function should not be used with (every_n_seconds / fps) < 1 due to rounding errors')
 
-        
-def images_into_array(image_folder_path: str):  # image_folder_path should be the same as output_folder
-    """Open all the images and append them together into a big numpy array."""
-    
+
+def get_sorted_image_list(image_folder_path):
     image_list = os.listdir(image_folder_path)
     image_list.sort()
+    return image_list
+
+
+def images_into_array(image_list, image_folder_path):  # image_folder_path should be the same as output_folder
+    """Open all the images and append them together into a big numpy array."""
+    
+    # image_list = os.listdir(image_folder_path)
+    # image_list.sort()
     
     images = []
     for file in image_list:
@@ -258,6 +281,7 @@ def images_into_array(image_folder_path: str):  # image_folder_path should be th
         if file[-4:] in ['.png', '.jpg']:
             file_path = os.path.join(image_folder_path, file)
             image = cv2.imread(file_path)
+            
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             images.append(image)
             
@@ -396,9 +420,9 @@ class InferenceDataset(Dataset):  # this needs a better name, ngl
         return image
     
 
-def load_binary_classifier():
+def load_binary_classifier(class_names):
     bc = models.resnet18(pretrained=False)  # load model
-    class_names = ['has_a_cow', 'has_no_cow']
+    # class_names = ['has_a_cow', 'has_no_cow']
     # adjust number of features to match the input
     num_features = bc.fc.in_features
     bc.fc = torch.nn.Linear(num_features, len(class_names))
@@ -438,6 +462,31 @@ def get_images_from_indices(array_to_match_from, what_to_match, image_list_to_fi
     
     return image_path_subset
 
+
+def identify_animal_cluster(classifier, dataloader, class_names):
+    classifier.eval()
+    cow_present_predictions = []
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = batch.to(DEVICE)
+            outputs = classifier(batch)
+            _, predicted_classes = torch.max(outputs, 1)
+            
+            cow_present_predictions.append(class_names[predicted_classes.cpu().numpy()[0]])
+    return cow_present_predictions
+
+
+def assign_animal_ids(feature_subset_):
+    """Identify the animals using DBSCAN to group them into different clusters."""
+    # reduce dimensions (is it overfit?)
+    tt = TSNE(n_components=2, random_state=42)
+    tt_results = tt.fit_transform(feature_subset_)
+    
+    # cluster w dbscan (overfitting watch!)
+    dbscan = DBSCAN(eps=10, min_samples=2)
+    animal_id_preds = dbscan.fit_predict(tt_results)
+    return animal_id_preds
+    
 
 if __name__ == '__main__':
     cli = argparse.ArgumentParser()
