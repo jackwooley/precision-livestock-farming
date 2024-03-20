@@ -103,7 +103,6 @@ def video_processor(video_source_folder: str, output_image_folder_: str, filenam
     date_ -- date the videos were taken on
     nth_frame -- specifies how frequently a frame is captured (e.g., if nth_frame == 120, then every 120th frame is cropped and written). Should be >= 1
     """
-    all_images_array = []
     print(filename)
     frame_number=0  # start the frames over at zero
     file_path = os.path.join(video_source_folder, filename)
@@ -132,14 +131,10 @@ def video_processor(video_source_folder: str, output_image_folder_: str, filenam
             print(f'An error occurred while cropping frame {timestamp1} from {filename} ({te}).')
             failed_iterations[filename] = [frame_number, 'crop']        
         try:
-            # write_image(image_to_write, timestamp1, output_image_folder_) #(image, timestamp: datetime.datetime.strptime, output_image_folder: str
-            all_images_array.append(image_to_write)
-        # except TypeError as te:
-        #     print(f'An error occurred while writing frame {timestamp1} from {filename} ({te}).')
-        #     failed_iterations[filename] = [frame_number, 'write']
-        except BaseException as be:
-            print(f'An error occurred while appending {timestamp1} to all_images_array ({be}).')
-            failed_iterations[filename] = [frame_number, 'append']
+            write_image(image_to_write, timestamp1, output_image_folder_) #(image, timestamp: datetime.datetime.strptime, output_image_folder: str
+        except TypeError as te:
+            print(f'An error occurred while writing frame {timestamp1} from {filename} ({te}).')
+            failed_iterations[filename] = [frame_number, 'write']
 
         timestamp1 = time_adder(timestamp1, nth_frame, fps=fps)  # plays the same role as unique_frame_counter
         if timestamp1 > timestamp2:
@@ -152,7 +147,7 @@ def video_processor(video_source_folder: str, output_image_folder_: str, filenam
             break
     cv2.destroyAllWindows()
     print(f'Unsuccessful iterations: {list(failed_iterations.values())}')
-    return all_images_array
+    return
 
 
 def get_video_processing_parameters(file_path_: str, codec_string: str = 'XVID'):
@@ -183,8 +178,7 @@ def crop_image(crop_region_: Union[tuple, list, np.array], frame):
             img = np.uint8(cropped_frame)  # convert to np array
         except BaseException as b:  # update with a more specific error
             # failed_iterations[filet] = frame_number
-            # print(f'something went wrong while trying to crop img_{frame_timestamp}: {b} ({type(b)})')
-            pass
+            print(f'something went wrong while trying to crop img_{frame_timestamp}: {b} ({type(b)})')
     
     return img
 
