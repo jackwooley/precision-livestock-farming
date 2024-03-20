@@ -65,6 +65,8 @@ def main(video_source_folder_: str, output_image_folder_: str, crop_reg: list, n
     batch_size = 1
     class_names = ['has_a_cow', 'has_no_cow']
     binary_classifier = load_binary_classifier(class_names)
+    resnet18_transform = resnet_transform(dim=224)
+    resnet50_transform = resnet_transform(dim=256)
     for lab in np.unique(km_labels):
         # get all images that correspond to a certain cluster
         sampled_img_paths = get_images_from_indices(km_labels, lab, sorted_image_names, output_image_folder_)  
@@ -75,19 +77,31 @@ def main(video_source_folder_: str, output_image_folder_: str, crop_reg: list, n
         # get predictions from those images
         cow_presence_preds = identify_animal_cluster(binary_classifier, labels_dataloader, class_names)
         if sum(np.array(cow_presence_preds) == 'has_a_cow') >= (.8 * len(cow_presence_preds)):
-            print(f'Many cow images detected in cluster {lab}. {lab} will be treated as the cluster with cows for the animal id section.')
+            print(f'Many cow images detected in cluster {lab}. {lab} will be treated as the cluster *with* cows for the animal id section.')
             cluster_with_cows = lab
-            break
+            # break
         else:
-            print(f'Few cow images detected in cluster {lab}.')
-    feature_subset = np.array(resnet_features)[km_labels == cluster_with_cows][:,:,0,0]
+            cluster_without_cows = lab
+            print(f'Few cow images detected in cluster {lab}. {lab} will be treated as the cluster *without* cows for the feed grade section.')
+    cow_present_features = np.array(resnet_features)[km_labels == cluster_with_cows]
+    # no_cow_present_features = np.array(resnet_features)[km_labels == cluster_without_cows][:,:,0,0]
     
-    animal_ids = assign_animal_ids(feature_subset)
+    # get animal ids
+    animal_ids = assign_animal_ids(cow_present_features, eps=8.2, minsamp=1)  # need to find a way to decide on what values to use for this round of clustering (DBSCAN/animal_id predictions)
+    
+    # get feed grades
+    feed_levels = ['S00','S05','S10','S20','S30','S40']
+    grader_model = load_feed_grader('feed_grading_mixture_dataset/best_model.pth', feed_levels)  # load model for inference
+    animal_images = InferenceDataset(np.array(sorted_image_paths)[np.array(km_labels) == cluster_without_cows], transform=resnet18_transform)  # get only images *without* cows
+    img_dataloader = DataLoader(animal_images, batch_size=batch_size)  # batch_size == 1
+    grades = get_feed_grades(grader_model, img_dataloader, feed_levels)  # get predictions
+    
+    # combine timestamps, feed_grades, and animal_ids together to create a csv
+    
+    get_final_csv(km_labels, cluster_with_cows, cluster_without_cows, grades, animal_ids, sorted_image_names)
+    # def get_final_csv(kmlabs, cowclust, nocowclust, feedgrades, animalids, imagelist):
+    
     return animal_ids
-    
-    ### TODO -- function for other transform (resnet18 input size instead of resnet50 size)
-    
-    ### TODO -- # get image_ids associated with each label in the kmeans
     
     # return video_source_folder, image_folder, crop_regions, nth_frame
 
@@ -178,7 +192,8 @@ def crop_image(crop_region_: Union[tuple, list, np.array], frame):
             img = np.uint8(cropped_frame)  # convert to np array
         except BaseException as b:  # update with a more specific error
             # failed_iterations[filet] = frame_number
-            print(f'something went wrong while trying to crop img_{frame_timestamp}: {b} ({type(b)})')
+            # print(f'something went wrong while trying to crop img_{frame_timestamp}: {b} ({type(b)})')
+            pass  # error handling occurs outside this function and in `main` instead
     
     return img
 
@@ -264,7 +279,8 @@ def time_adder(datetime_object: datetime.datetime, every_n_frames: float, fps=30
 
 
 def get_sorted_image_list(image_folder_path):
-    image_list = os.listdir(image_folder_path)
+    image_list_ = os.listdir(image_folder_path)
+    image_list = [i for i in image_list_ if i != '.ipynb_checkpoints']
     image_list.sort()
     return image_list
 
@@ -291,7 +307,7 @@ def images_into_array(image_list, image_folder_path):  # image_folder_path shoul
 
 
 def load_feature_extractor():
-    """Load a resnet in evaluation mode."""
+    """Load a resnet50 in evaluation mode."""
     
     resnet = models.resnet50(pretrained=True)
     resnet.eval()
@@ -310,14 +326,13 @@ def resnet50_transform():
     return transform
 
 
-def resnet18_transform():
+def resnet_transform(dim: int, mean=np.array([0.485, 0.456, 0.406]), std=np.array([0.229, 0.224, 0.225])):
     """Create a transformation pipeline with the appropriate input image size for a resnet18."""
-    ### TODO -- combine the two transformation functions into one that just takes the input dumension as an argument
-    mean = np.array([0.485, 0.456, 0.406])  # double-check to make sure these are the right values
-    std = np.array([0.229, 0.224, 0.225])
-    
+    # mean = np.array([0.485, 0.456, 0.406])  # double-check to make sure these are the right values
+    # std = np.array([0.229, 0.224, 0.225])
+    # mean and std are the values from the imagenet training dataset
     transform = transforms.Compose([
-        transforms.Resize((224,224)),
+        transforms.Resize((dim,dim)),
         transforms.ToTensor(),
         transforms.Normalize(mean, std)
     ])
@@ -329,7 +344,7 @@ def extract_features(image_array):
 
     # load resnet50 in eval mode w last layer "sliced" off, create transform pipeline
     feature_extractor = load_feature_extractor()
-    transform = resnet50_transform()
+    transform = resnet_transform(256)
     # device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f'Beginning feature extraction using {DEVICE}...')
     fe = feature_extractor.to(DEVICE)
@@ -476,16 +491,64 @@ def identify_animal_cluster(classifier, dataloader, class_names):
     return cow_present_predictions
 
 
-def assign_animal_ids(feature_subset_):
+def assign_animal_ids(feature_subset_, eps, minsamp):
     """Identify the animals using DBSCAN to group them into different clusters."""
     # reduce dimensions (is it overfit?)
     tt = TSNE(n_components=2, random_state=42)
     tt_results = tt.fit_transform(feature_subset_)
     
     # cluster w dbscan (overfitting watch!)
-    dbscan = DBSCAN(eps=10, min_samples=2)
+    dbscan = DBSCAN(eps=eps, min_samples=minsamp)  # find better parameters
     animal_id_preds = dbscan.fit_predict(tt_results)
     return animal_id_preds
+
+
+def load_feed_grader(model_path: str, class_names: list):
+    """Load the feed grading model and set it to predict the correct number of classes."""
+    grade_model = models.resnet18(pretrained=False)
+    num_ftrs = grade_model.fc.in_features
+    grade_model.fc = torch.nn.Linear(num_ftrs, len(class_names))
+    grade_model.load_state_dict(torch.load(model_path))
+    grade_model = grade_model.to(DEVICE)
+    
+    return grade_model
+
+
+def get_feed_grades(classifier, dataloader, classes):
+    classifier.eval()
+    feed_grades = []
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = batch.to(DEVICE)
+            outputs = classifier(batch)
+            _, predicted_classes = torch.max(outputs, 1)
+            feed_grades.append(classes[predicted_classes.cpu().numpy()[0]])            
+    return feed_grades
+
+
+def get_final_csv(kmlabs, cowclust, nocowclust, feedgrades, animalids, imagelist):
+    animal_id = []
+    feed_grade = []
+    timestamp_ = []
+    cls_counter = 0
+    gp_counter = 0
+    for i in range(len(kmlabs)):
+        if kmlabs[i] == nocowclust:
+            animal_id.append(np.nan)
+            feed_grade.append(feedgrades[gp_counter])
+            gp_counter += 1
+        elif kmlabs[i] == cowclust:
+            animal_id.append(animalids[cls_counter])
+            feed_grade.append(np.nan)
+            cls_counter += 1
+        timestamp_.append(datetime.datetime.strftime(datetime.datetime.strptime(re.sub('_', '/', imagelist[i][9:15]) + re.sub('_', '/', imagelist[i][4:8]) + ' ' + re.sub('_', ':', imagelist[i][15:-4]), '%m/%d/%Y %H:%M:%S') - datetime.timedelta(seconds=2), format='%m/%d/%Y %H:%M:%S'))
+    
+    final_df = pd.DataFrame({'timestamp': timestamp_, 'animal_id': animal_id, 'grade': feed_grade})
+    time_of_writing = datetime.datetime.strftime(datetime.datetime.now(), '%m%d%Y_%H%M%S')
+    try:
+        final_df.to_csv(f'results_{time_of_writing}.csv', index=False)
+    except BaseException as be:
+        print(f'There was an issue writing your final results to a csv. Check if results_{time_of_writing}.csv has been written to the directory you ran this script from. If not, you may need to run the pipeline again.')
     
 
 if __name__ == '__main__':
